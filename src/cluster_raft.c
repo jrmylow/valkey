@@ -1919,6 +1919,7 @@ static int clusterRaftProcessAppendEntriesResponse(clusterLink *link, int argc, 
 
     clusterRaftMaybeStepDown(msg_term);
     if (rs->role != RAFT_ROLE_LEADER) return 1;
+    if (msg_term < rs->current_term) return 1;
 
     clusterNode *node = link->node;
     if (!node) return 1;
@@ -1948,6 +1949,7 @@ static int clusterRaftProcessAppendEntriesResponse(clusterLink *link, int argc, 
 
     if (success) {
         /* Follower accepted — update matchIndex/nextIndex. */
+        debugServerAssert(follower_last_index <= raftLogLastIndex());
         rd->match_index = follower_last_index;
         rd->next_index = follower_last_index + 1;
 
