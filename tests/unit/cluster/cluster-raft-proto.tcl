@@ -24,6 +24,14 @@ proc raft_send {fd payload} {
     flush $fd
 }
 
+# Send multiple payloads on a cluster bus connection (for forcing message ordering)
+proc raft_send_batch {fd payloads} {
+    foreach payload $payloads {
+        puts -nonewline $fd [raft_msg $payload]
+    }
+    flush $fd
+}
+
 # Read a raft message from a cluster bus connection. Returns the payload.
 proc raft_recv {fd {timeout 5000}} {
     # Read 8-byte header
@@ -1172,6 +1180,163 @@ start_multiple_servers 2 {overrides {cluster-enabled yes cluster-protocol raft c
 
             close $fd
         }
+    }
+}
+
+# Build an AE message with the given entry lines.
+proc raft_ae {leader_id term prev_idx prev_term commit entries} {
+    set msg "AE $leader_id $term $prev_idx $prev_term $commit [llength $entries]"
+    foreach entry $entries {
+        append msg "\n$entry"
+    }
+    return $msg
+}
+ 
+# Have the server join a cluster led by fake node L in term 1, with entries
+# 1-2 (L and the server joining as voters) committed. Returns L's fd.
+proc raft_join_fake_leader {l_id l_addr node_id node_addr} {
+    set cport [expr {[srv 0 port] + 10000}]
+    set fd [raft_connect_fake_node 127.0.0.1 $cport $l_id $l_addr]
+    
+    raft_send $fd "MEET cluster"
+    assert_match "ADD_ME*" [raft_recv $fd]
+    
+    raft_send $fd [raft_ae $l_id 1 0 0 2 [list "1 NODE_JOIN $l_id $l_addr voter" "1 NODE_JOIN $node_id $node_addr voter"]]
+    raft_recv_until $fd "AE_ACK 1 1 *"
+    assert_equal 2 [CI 0 cluster_raft_last_applied]
+    
+    # Say HELLO again now that the server knows L, so this link is L's.
+    raft_send $fd "HELLO $l_id $l_addr"
+    raft_recv_until $fd "HI *"
+    return $fd
+}
+ 
+# Give the server an uncommitted term-2 tail after index 2, from fake node
+# L0. L0 isn't a known node, so the ACK for it isn't sent; wait for the term.
+proc raft_add_stale_tail {fd l0_id entries} {
+    raft_send $fd [raft_ae $l0_id 2 2 1 2 $entries]
+    wait_for_condition 50 100 {
+        [CI 0 cluster_raft_current_term] == 2
+    } else {
+        fail "L0's AE was not accepted"
+    }
+}
+ 
+# Send an AE the server rejects at once (unknown prev index), and read
+# AE_ACKs until that rejection arrives. Returns the success ACKs received
+# before it that claim a last index past max, including any ACK deferred to
+# beforeSleep by earlier messages. Waits a little first, so the probe is read
+# in a later event-loop pass.
+proc raft_success_acks_past {fd l_id term max} {
+    after 100
+    raft_send $fd [raft_ae $l_id $term 1000 $term 0 {}]
+    set acks {}
+    while {1} {
+        set reply [raft_recv_until $fd "AE_ACK *"]
+        if {[string match "AE_ACK $term 0 *" $reply]} break
+        set fields [split $reply " "]
+        if {[lindex $fields 2] == 1 && [lindex $fields 3] > $max} {
+            lappend acks $reply
+        }
+    }
+    return $acks
+}
+
+test "Raft proto: no AE_ACK success for a rejected AE batched after an accepted one" {
+    # An accepted AE from L0 (term 2) and a rejected AE from L (term 3) are
+    # handled in the same event-loop pass. The success ACK deferred by L0's
+    # AE must not be sent to L, which had no AE accepted.
+    start_server {overrides {cluster-enabled yes cluster-protocol raft cluster-node-timeout 1000}} {
+        set node_id [R 0 CLUSTER MYID]
+        set node_addr "127.0.0.1:[srv 0 port]@[expr {[srv 0 port] + 10000}],,tls-port=0,shard-id=[string repeat a 40]"
+        set l_id [string repeat "d" 40]
+        set l_addr "127.0.0.1:9995@19995,,tls-port=0,shard-id=[string repeat e 40]"
+        set l0_id [string repeat "c" 40]
+        set l0_addr "127.0.0.1:9994@19994,,tls-port=0,shard-id=[string repeat f 40]"
+ 
+        set fd [raft_join_fake_leader $l_id $l_addr $node_id $node_addr]
+ 
+        # L0's AE (term 2) appends 3-5 and is accepted. L's AE (term 3) has
+        # prev 3/1, which doesn't match the server's 3 (term 2). Both go in
+        # one write, so they're handled in one pass. The server takes the
+        # leader from the message, not the link, so L0's AE can go on L's
+        # socket.
+        set tail [lrepeat 3 "2 NODE_INFO $l0_id $l0_addr noflags"]
+        raft_send_batch $fd [list \
+            [raft_ae $l0_id 2 2 1 2 $tail] \
+            [raft_ae $l_id 3 3 1 2 [list "3 NODE_INFO $l_id $l_addr noflags"]]]
+ 
+        assert_match "AE_ACK 3 0 5 *" [raft_recv_until $fd "AE_ACK *"]
+        assert_equal 3 [CI 0 cluster_raft_current_term]
+        assert_equal $l_id [CI 0 cluster_raft_leader]
+        # No AE from L was accepted, so no success may follow.
+        assert_equal {} [raft_success_acks_past $fd $l_id 3 0]
+        close $fd
+    }
+}
+ 
+test "Raft proto: partly processed AE does not commit or ACK past what it verified" {
+    # L's AE (term 3) matches at prev 2 but its entry 3 has an unknown type,
+    # so the entry loop stops before comparing the server's stale tail 3-5.
+    # The server must not commit past 2 (Raft Figure 2: min(leaderCommit,
+    # index of last new entry)), apply its stale entry 3, or ACK past 2.
+    start_server {overrides {cluster-enabled yes cluster-protocol raft cluster-node-timeout 1000}} {
+        set node_id [R 0 CLUSTER MYID]
+        set node_addr "127.0.0.1:[srv 0 port]@[expr {[srv 0 port] + 10000}],,tls-port=0,shard-id=[string repeat a 40]"
+        set l_id [string repeat "d" 40]
+        set l_addr "127.0.0.1:9995@19995,,tls-port=0,shard-id=[string repeat e 40]"
+        set l0_id [string repeat "c" 40]
+        set l0_addr "127.0.0.1:9994@19994,,tls-port=0,shard-id=[string repeat f 40]"
+        set x_id [string repeat "8" 40]
+        set x_addr "127.0.0.1:9991@19991,,tls-port=0,shard-id=[string repeat 3 40]"
+ 
+        set fd [raft_join_fake_leader $l_id $l_addr $node_id $node_addr]
+        # Stale entry 3 adds X as a learner, so applying it is visible.
+        raft_add_stale_tail $fd $l0_id [list \
+            "2 NODE_JOIN $x_id $x_addr learner" \
+            "2 NODE_INFO $l0_id $l0_addr noflags" \
+            "2 NODE_INFO $l0_id $l0_addr noflags"]
+        assert_equal 2 [CI 0 cluster_raft_commit_index]
+        assert_equal 0 [raft_node_visible [srv 0 client] $x_id]
+ 
+        raft_send $fd [raft_ae $l_id 3 2 1 3 [list "3 FUTURE_ENTRY_TYPE data"]]
+ 
+        assert_equal {} [raft_success_acks_past $fd $l_id 3 2]
+        assert_equal 2 [CI 0 cluster_raft_commit_index]
+        assert_equal 0 [raft_node_visible [srv 0 client] $x_id]
+        close $fd
+    }
+}
+ 
+test "Raft proto: INSTALL_SNAPSHOT is not ACKed past the snapshot" {
+    # A snapshot from L (term 3) verifies the log only up to its last entry.
+    # Two paths skip installing it and ACK: the snapshot is at or before
+    # last_applied, or the log already has its last entry. Neither may claim
+    # the server's stale tail 3-5.
+    start_server {overrides {cluster-enabled yes cluster-protocol raft cluster-node-timeout 1000}} {
+        set node_id [R 0 CLUSTER MYID]
+        set node_addr "127.0.0.1:[srv 0 port]@[expr {[srv 0 port] + 10000}],,tls-port=0,shard-id=[string repeat a 40]"
+        set l_id [string repeat "d" 40]
+        set l_addr "127.0.0.1:9995@19995,,tls-port=0,shard-id=[string repeat e 40]"
+        set l0_id [string repeat "c" 40]
+        set l0_addr "127.0.0.1:9994@19994,,tls-port=0,shard-id=[string repeat f 40]"
+ 
+        set fd [raft_join_fake_leader $l_id $l_addr $node_id $node_addr]
+        raft_add_stale_tail $fd $l0_id [lrepeat 3 "2 NODE_INFO $l0_id $l0_addr noflags"]
+        assert_equal 2 [CI 0 cluster_raft_last_applied]
+ 
+        set nodes "\n$l_id $l_addr master - 0 0 1 connected 0-16383"
+        append nodes "\n$node_id $node_addr master - 0 0 1 connected"
+ 
+        # Snapshot at 2 (term 1), already applied.
+        raft_send $fd "INSTALL_SNAPSHOT $l_id 3 2 1$nodes"
+        set past_applied [raft_success_acks_past $fd $l_id 3 2]
+        # Snapshot at 3 (term 2), already in the log.
+        raft_send $fd "INSTALL_SNAPSHOT $l_id 3 3 2$nodes"
+        set past_in_log [raft_success_acks_past $fd $l_id 3 3]
+ 
+        assert_equal {} [concat $past_applied $past_in_log]
+        close $fd
     }
 }
 
